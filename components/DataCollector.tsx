@@ -1,0 +1,318 @@
+import React, { useState, useRef, useEffect } from 'react';
+import { Search, UploadCloud, FileText, Target as TargetIcon, Terminal, Trash2, Copy, Save, Settings, Loader2, Globe } from 'lucide-react';
+import { sendTelegramNotification } from './TelegramSettings';
+
+const StatCard: React.FC<{ icon: React.ReactNode; label: string; value: number | string; color: string }> = ({ icon, label, value, color }) => (
+  <div className="bg-gray-50 dark:bg-gray-700/50 p-4 rounded-lg flex items-center gap-4 border dark:border-gray-700">
+    <div className="p-2 rounded-md" style={{ backgroundColor: color }}>{icon}</div>
+    <div>
+      <p className="text-xs text-gray-500 uppercase font-semibold">{label}</p>
+      <p className="text-xl font-bold dark:text-gray-100">{value}</p>
+    </div>
+  </div>
+);
+
+const DataCollector: React.FC = () => {
+    const [searchQuery, setSearchQuery] = useState('');
+    const [isSearching, setIsSearching] = useState(false);
+    const [inputText, setInputText] = useState('');
+    const [consoleLogs, setConsoleLogs] = useState<string[]>(['[CONSOLE] Ready.']);
+    const [isExtracting, setIsExtracting] = useState(false);
+    const [fileCount, setFileCount] = useState(0);
+    const [wordCount, setWordCount] = useState(0);
+    const [separatorInterval, setSeparatorInterval] = useState(25);
+    const [separatorString, setSeparatorString] = useState('__SEP__');
+    const fileInputRef = useRef<HTMLInputElement>(null);
+    const consoleEndRef = useRef<HTMLDivElement>(null);
+    
+    useEffect(() => {
+        consoleEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    }, [consoleLogs]);
+    
+    useEffect(() => {
+        const words = inputText.trim().split(/\s+/).filter(Boolean);
+        setWordCount(words.length);
+    }, [inputText]);
+
+    const addLog = (message: string) => setConsoleLogs(prev => [...prev, message]);
+    
+    const handleSearch = async () => {
+        if (!searchQuery.trim()) return;
+        
+        setIsSearching(true);
+        addLog(`[INIT] Starting unified search for "${searchQuery}"...`);
+        
+        let foundUrls: string[] = [];
+
+        const fetchWithProxyFallbacks = async (targetUrl: string, sourceName: string) => {
+            const proxies = [
+                { name: 'CORS.EU.ORG', url: (url: string) => `https://cors.eu.org/${url.replace(/^https?:\/\//, '')}` },
+                { name: 'AllOrigins', url: (url: string) => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}` },
+                { name: 'CORS-Proxy.io', url: (url: string) => `https://corsproxy.io/?${encodeURIComponent(url)}` }
+            ];
+            let lastError: Error | null = null;
+
+            for (const proxy of proxies) {
+                const proxyUrl = proxy.url(targetUrl);
+                addLog(`[PROXY] Trying via ${proxy.name}...`);
+                try {
+                    const response = await fetch(proxyUrl);
+                    if (!response.ok) {
+                        throw new Error(`Proxy ${proxy.name} returned status ${response.status}`);
+                    }
+                    
+                    const contentType = response.headers.get('content-type');
+                    if (!contentType || !(contentType.toLowerCase().includes('application/json') || contentType.toLowerCase().includes('application/x-javascript'))) {
+                         const responseText = await response.text();
+                         console.error(`${proxy.name} non-JSON response:`, responseText.substring(0, 500)); 
+                         throw new Error(`Expected JSON from ${proxy.name}, but received different content type.`);
+                    }
+                    return await response.json();
+                } catch (error: any) {
+                    lastError = error;
+                    addLog(`[WARN] Proxy ${proxy.name} failed: ${error.message}`);
+                }
+            }
+            throw lastError || new Error(`All proxies failed for ${sourceName}.`);
+        };
+
+        try {
+            // Phase 1: Web Search (Primary)
+            addLog(`[SEARCH] Phase 1: Querying Web (DuckDuckGo) for PDFs...`);
+            const ddgQuery = `${searchQuery} filetype:pdf`;
+            const ddgUrl = `https://api.duckduckgo.com/?q=${encodeURIComponent(ddgQuery)}&format=json`;
+            
+            try {
+                const data = await fetchWithProxyFallbacks(ddgUrl, 'DuckDuckGo');
+                addLog(`[DUCKDUCKGO] Successfully connected and received data.`);
+
+                const flattenTopics = (topics: any[] = []): any[] => topics.reduce((acc, topic) => {
+                    acc.push(topic);
+                    if (topic.Topics) acc.push(...flattenTopics(topic.Topics));
+                    return acc;
+                }, []);
+                
+                const allItems = [...flattenTopics(data?.RelatedTopics), ...(data?.Results || [])];
+                const urls = allItems
+                    .map((r: { FirstURL?: string }) => r.FirstURL)
+                    .filter((url?: string): url is string => !!url && url.toLowerCase().includes('.pdf'));
+                
+                foundUrls.push(...urls);
+                addLog(`[WEB] Found ${urls.length} potential PDF links from DuckDuckGo.`);
+            } catch (error) {
+                addLog(`[WARN] Web search phase failed. Proceeding to fallback.`);
+            }
+
+            // Phase 2: Internet Archive (Fallback)
+            if (foundUrls.length === 0) {
+                addLog(`[SEARCH] Phase 2: Querying Internet Archive...`);
+                const archiveUrl = `https://archive.org/advancedsearch.php?q=subject:(${encodeURIComponent(searchQuery)}) AND mediatype:(texts) AND format:(PDF)&fl[]=identifier,title&rows=50&output=json`;
+                
+                try {
+                    const data = await fetchWithProxyFallbacks(archiveUrl, 'Internet Archive');
+                    const docs = data?.response?.docs || [];
+                    const urls = docs.map((doc: { identifier: string }) => 
+                        `https://archive.org/download/${doc.identifier}/${doc.identifier}.pdf`
+                    );
+                    foundUrls.push(...urls);
+                    addLog(`[ARCHIVE] Found ${urls.length} PDF links from Internet Archive.`);
+                } catch (error) {
+                    addLog(`[WARN] Archive search phase also failed.`);
+                }
+            }
+
+            // Final Result Processing
+            if (foundUrls.length > 0) {
+                const uniqueUrls = Array.from(new Set(foundUrls));
+                const newText = uniqueUrls.join('\n');
+                setInputText(prev => prev + (prev ? '\n' : '') + newText);
+                addLog(`[SUCCESS] Added ${uniqueUrls.length} unique PDF links to the workspace.`);
+            } else {
+                addLog(`[INFO] No PDF files found for "${searchQuery}" from any source.`);
+            }
+
+        } catch (err: any) {
+            console.error(err);
+            const errorMessage = err.message || 'Unknown error';
+            addLog(`[ERROR] Search failed: ${errorMessage}`);
+        } finally {
+            setIsSearching(false);
+        }
+    };
+
+    const handleFileChange = (event: React.ChangeEvent<HTMLInputElement>) => {
+        const files = event.target.files;
+        if (!files) return;
+        const readPromises = Array.from(files).map((file: File) => {
+            return new Promise<string>((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onload = (e: ProgressEvent<FileReader>) => resolve(e.target?.result as string);
+                reader.onerror = () => reject(new Error(`Failed to read ${file.name}`));
+                reader.readAsText(file);
+            });
+        });
+        Promise.all(readPromises).then(contents => {
+            setInputText(prev => prev + (prev ? '\n' : '') + contents.join('\n'));
+            setFileCount(prev => prev + files.length);
+            addLog(`[LOAD] Added ${files.length} files to workspace.`);
+        }).catch(err => {
+            if (err instanceof Error) addLog(`[ERROR] ${err.message}`);
+        });
+    };
+    
+    const handleSeparateText = () => {
+        if (!inputText) return;
+        const lines = inputText.split('\n');
+        const newLines = [];
+        for (let i = 0; i < lines.length; i++) {
+            newLines.push(lines[i]);
+            if ((i + 1) % separatorInterval === 0 && i < lines.length - 1) newLines.push(separatorString);
+        }
+        setInputText(newLines.join('\n'));
+        addLog(`[SUCCESS] Separators inserted every ${separatorInterval} lines.`);
+    };
+
+    const handleExtraction = async () => {
+        setIsExtracting(true);
+        addLog("[INIT] Processing data for Telegram...");
+        const urlRegex = /https?:\/\/[^\s"<>]+/g;
+        const urls = inputText.match(urlRegex);
+        
+        let notificationContent = '';
+        if (urls) {
+            const uniqueUrls = Array.from(new Set(urls));
+            notificationContent = `Extracted Unique URLs (${uniqueUrls.length}):\n${uniqueUrls.join('\n')}\n\nFull Workspace Data:\n${inputText}`;
+            addLog(`[SUCCESS] Found ${uniqueUrls.length} unique URLs.`);
+        } else {
+            notificationContent = `Workspace Analysis Result:\nWord count: ${wordCount}\n\nContent:\n${inputText}`;
+            addLog("[DONE] Text analyzed and sent.");
+        }
+    
+        const success = await sendTelegramNotification('Data Collector Export', notificationContent, 'workspace_data.txt');
+        if (success) addLog("[TELEGRAM] Data transmitted successfully.");
+        else addLog("[TELEGRAM] Transmission failed.");
+        
+        setIsExtracting(false);
+    };
+
+    return (
+      <div className="container mx-auto px-4 sm:px-6 lg:px-8 max-w-7xl animate-fade-in">
+        <div className="bg-white dark:bg-gray-800 rounded-xl shadow-lg p-6 md:p-8 border border-gray-100 dark:border-gray-700">
+            <header className="mb-8 text-center">
+                <h1 className="text-3xl font-bold dark:text-white flex items-center justify-center gap-3">
+                    <TargetIcon className="text-blue-500" /> Data Collector Dashboard
+                </h1>
+                <p className="text-sm text-gray-500 dark:text-gray-400 mt-2">Find and organize global PDF links and text data</p>
+            </header>
+
+            <div className="bg-gray-50 dark:bg-gray-900 p-4 mb-8 flex flex-col sm:flex-row items-center gap-4 rounded-xl border border-gray-200 dark:border-gray-700 shadow-inner">
+                <div className="relative flex-1 w-full">
+                    <Search className="absolute left-4 top-1/2 -translate-y-1/2 text-gray-400" size={18} />
+                    <input 
+                        type="text" 
+                        placeholder="Keyword for PDF search..." 
+                        value={searchQuery} 
+                        onChange={(e) => setSearchQuery(e.target.value)} 
+                        className="w-full bg-white dark:bg-gray-800 pl-12 pr-4 py-3 rounded-lg dark:text-white outline-none border border-transparent focus:border-blue-500 transition-all" 
+                        onKeyDown={(e) => e.key === 'Enter' && handleSearch()}
+                    />
+                </div>
+                <button 
+                    onClick={handleSearch} 
+                    disabled={isSearching || !searchQuery.trim()}
+                    className="w-full sm:w-auto bg-blue-600 hover:bg-blue-700 text-white px-8 py-3 rounded-lg font-bold transition-all flex items-center justify-center gap-2 disabled:opacity-50 shadow-md active:scale-95"
+                >
+                    {isSearching ? <Loader2 className="animate-spin" size={18} /> : <Search size={18} />}
+                    {isSearching ? "SEARCHING..." : "SEARCH"}
+                </button>
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-5 gap-8">
+                <div className="lg:col-span-3 flex flex-col gap-6">
+                    <div className="relative group">
+                        <div className="absolute top-3 right-3 flex gap-2">
+                             <button onClick={() => setInputText('')} className="p-2 bg-gray-200/50 dark:bg-gray-700/50 hover:bg-red-500 hover:text-white rounded transition-colors text-gray-500 dark:text-gray-400">
+                                <Trash2 size={16} />
+                             </button>
+                        </div>
+                        <textarea 
+                            value={inputText} 
+                            onChange={(e) => setInputText(e.target.value)} 
+                            className="w-full h-80 bg-gray-50 dark:bg-gray-900 dark:text-white p-4 rounded-xl outline-none border border-gray-200 dark:border-gray-700 font-mono text-sm leading-relaxed focus:ring-2 focus:ring-blue-500 transition-all" 
+                            placeholder="Search results and uploads appear here..." 
+                        />
+                    </div>
+                    
+                    <div onClick={() => fileInputRef.current?.click()} className="border-2 border-dashed border-gray-300 dark:border-gray-700 rounded-xl p-10 text-center cursor-pointer hover:border-blue-500 hover:bg-blue-50 dark:hover:bg-blue-900/10 transition-all group">
+                        <UploadCloud className="mx-auto text-gray-400 group-hover:text-blue-500 mb-2 transition-colors" size={32} />
+                        <p className="dark:text-white font-medium">Upload bulk text files</p>
+                        <p className="text-xs text-gray-400 mt-1">Append raw data to current workspace</p>
+                        <input type="file" ref={fileInputRef} onChange={handleFileChange} className="hidden" multiple />
+                    </div>
+                </div>
+
+                <div className="lg:col-span-2 flex flex-col gap-6">
+                    <div className="grid grid-cols-1 gap-4">
+                       <StatCard icon={<FileText size={20} className="text-white"/>} label="LOADED FILES" value={fileCount} color="#3b82f6" />
+                       <StatCard icon={<FileText size={20} className="text-white"/>} label="WORKSPACE WORDS" value={wordCount} color="#22c55e" />
+                    </div>
+
+                    <div className="bg-gray-50 dark:bg-gray-700/30 p-5 rounded-xl border border-gray-200 dark:border-gray-700">
+                        <div className="flex items-center gap-2 mb-4 text-xs font-bold text-gray-500 uppercase">
+                            <Settings size={14} /> Organization Tools
+                        </div>
+                        <div className="flex gap-2 mb-3">
+                            <div className="flex-1">
+                                <label className="text-[10px] text-gray-400 uppercase font-bold mb-1 block">Every X lines</label>
+                                <input type="number" value={separatorInterval} onChange={(e) => setSeparatorInterval(Number(e.target.value))} className="w-full p-2 text-sm rounded-lg border dark:bg-gray-800 dark:border-gray-600 dark:text-white outline-none focus:border-blue-500" />
+                            </div>
+                            <div className="flex-[2]">
+                                <label className="text-[10px] text-gray-400 uppercase font-bold mb-1 block">Separator String</label>
+                                <input type="text" value={separatorString} onChange={(e) => setSeparatorString(e.target.value)} className="w-full p-2 text-sm rounded-lg border dark:bg-gray-800 dark:border-gray-600 dark:text-white outline-none focus:border-blue-500" />
+                            </div>
+                        </div>
+                        <button onClick={handleSeparateText} className="w-full bg-white dark:bg-gray-800 hover:bg-gray-100 dark:hover:bg-gray-700 text-blue-600 dark:text-blue-400 border border-blue-200 dark:border-blue-900/50 py-3 rounded-lg text-sm font-bold shadow-sm transition-all active:scale-95">
+                            Format Workspace
+                        </button>
+                    </div>
+
+                    <button 
+                        onClick={handleExtraction} 
+                        disabled={isExtracting || !inputText.trim()} 
+                        className="w-full bg-emerald-600 hover:bg-emerald-700 text-white font-bold py-4 rounded-xl shadow-lg transition-all active:scale-95 flex items-center justify-center gap-2 disabled:opacity-50"
+                    >
+                        {isExtracting ? <Loader2 className="animate-spin" size={20} /> : <Save size={20} />}
+                        {isExtracting ? "PROCESSING..." : "EXPORT TO TELEGRAM"}
+                    </button>
+
+                    <div className="flex flex-col flex-1 min-h-[200px] bg-gray-900 rounded-xl border border-gray-800 overflow-hidden shadow-2xl">
+                        <div className="bg-gray-800 px-4 py-2 flex items-center gap-2">
+                             <Terminal size={14} className="text-blue-400" />
+                             <span className="text-[10px] font-bold text-gray-400 uppercase tracking-widest">Process Stream</span>
+                        </div>
+                        <div className="p-4 h-full overflow-y-auto font-mono text-[10px] text-blue-400/90 space-y-1">
+                            {consoleLogs.map((log, i) => (
+                                <div key={i} className="flex gap-2">
+                                    <span className="opacity-30">[{i}]</span>
+                                    <span className={
+                                        log.includes('[ERROR]') ? 'text-red-400' : 
+                                        log.includes('[SUCCESS]') ? 'text-emerald-400' : 
+                                        log.includes('[WEB]') ? 'text-purple-400' : 
+                                        log.includes('[ARCHIVE]') ? 'text-cyan-400' : 
+                                        log.includes('[WARN]') ? 'text-amber-400' : 
+                                        log.includes('[DUCKDUCKGO]') ? 'text-orange-400' :
+                                        log.includes('[PROXY]') ? 'text-gray-400' : ''
+                                    }>{log}</span>
+                                </div>
+                            ))}
+                            <div ref={consoleEndRef} />
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+      </div>
+    );
+};
+
+export default DataCollector;
